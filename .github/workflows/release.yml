@@ -1,0 +1,417 @@
+# Release builder for the 1tuz/speech-studio fork.
+#
+# The stock `build` workflow publishes releases only through the
+# `release-macos` lane (signed + notarized), which is bound to the `release`
+# GitHub environment and to environment-scoped Apple secrets (APPLE_CERTIFICATE,
+# APPLE_ID, APPLE_TEAM_ID, TAURI_SIGNING_PRIVATE_KEY, ...). This fork has no
+# environments, no signing secrets, and the tauri updater plugin is not
+# configured in tauri.conf.json — so that lane cannot run here.
+#
+# This workflow instead builds unsigned installers for all three platforms and
+# attaches them to a regular GitHub Release. macOS artifacts are ad-hoc signed
+# (right-click → Open on first launch to bypass Gatekeeper).
+#
+# Trigger with:
+#   gh workflow run release.yml -R 1tuz/speech-studio
+
+name: release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release-macos:
+    name: macOS (Apple Silicon, ad-hoc)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Check out speech-studio
+        uses: actions/checkout@v4
+        with:
+          path: speech-studio
+
+      - name: Check out speech-swift (sibling repo)
+        uses: actions/checkout@v4
+        with:
+          repository: soniqo/speech-swift
+          path: speech-swift
+          ref: aa0c0dacfc14778c4b9a20f0a67095eb75a3df85
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            speech-studio/src-tauri/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('speech-studio/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Set up Node + pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: speech-studio/pnpm-lock.yaml
+
+      - name: Install JS deps
+        working-directory: speech-studio
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Swift sidecar
+        working-directory: speech-studio/swift-sidecar
+        run: swift build -c release --build-tests -Xswiftc -enable-testing
+
+      - name: Stage sidecar + metallib for Tauri bundler
+        env:
+          # Pin the speech-swift release we pull the metallib from.
+          SPEECH_SWIFT_RELEASE: v0.0.18
+        working-directory: speech-studio
+        run: |
+          mkdir -p src-tauri/binaries
+          # externalBin convention: Tauri appends the target triple to the
+          # configured name (binaries/soniqo-tts-sidecar →
+          # binaries/soniqo-tts-sidecar-aarch64-apple-darwin).
+          cp swift-sidecar/.build/release/soniqo-tts-sidecar \
+             src-tauri/binaries/soniqo-tts-sidecar-aarch64-apple-darwin
+          # MLX-Swift drops mlx.metallib into the build tree as a side effect;
+          # on CI that side effect never fires, so pull a known-good metallib
+          # from the speech-swift release tarball instead.
+          curl -sSL --fail \
+            "https://github.com/soniqo/speech-swift/releases/download/${SPEECH_SWIFT_RELEASE}/speech-macos-arm64.tar.gz" \
+            -o /tmp/speech-release.tar.gz
+          tar -xzf /tmp/speech-release.tar.gz -C /tmp mlx.metallib
+          cp /tmp/mlx.metallib src-tauri/binaries/mlx.metallib
+          cp /tmp/mlx.metallib swift-sidecar/.build/release/mlx.metallib
+          for test_dir in swift-sidecar/.build/release/*.xctest/Contents/MacOS; do
+            if [[ -d "$test_dir" ]]; then
+              cp /tmp/mlx.metallib "$test_dir/"
+            fi
+          done
+          ls -la src-tauri/binaries/
+
+      - name: Test audio cleanup and debug capture
+        working-directory: speech-studio/swift-sidecar
+        run: swift test -c release --skip-build --filter AudioPostprocessingTests
+
+      - name: Run Rust unit tests
+        working-directory: speech-studio/src-tauri
+        run: cargo test --lib
+
+      - name: Run frontend tests
+        working-directory: speech-studio
+        run: pnpm test
+
+      - name: Type-check
+        working-directory: speech-studio
+        run: pnpm tsc --noEmit
+
+      - name: Build Tauri bundle (.app + .dmg, ad-hoc signed)
+        working-directory: speech-studio
+        run: |
+          set -euo pipefail
+
+          cleanup_stale_dmg_mounts() {
+            echo "::group::macOS disk image cleanup"
+            hdiutil info || true
+            while IFS= read -r device; do
+              [[ -n "$device" ]] || continue
+              echo "Detaching stale Speech Studio disk image: $device"
+              hdiutil detach "$device" || hdiutil detach -force "$device" || true
+            done < <(hdiutil info | awk '/\/Volumes\/Speech Studio/ { print $1 }' | sort -u)
+            rm -f src-tauri/target/release/bundle/dmg/rw.*.dmg || true
+            echo "::endgroup::"
+          }
+
+          if ! pnpm tauri build; then
+            echo "::warning::Tauri macOS bundle failed once; cleaning stale disk images and retrying."
+            cleanup_stale_dmg_mounts
+            sleep 5
+            pnpm tauri build
+          fi
+
+      - name: Upload .dmg
+        uses: actions/upload-artifact@v4
+        with:
+          name: speech-studio-macos-arm64-dmg
+          path: speech-studio/src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Zip .app
+        working-directory: speech-studio
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="src-tauri/target/release/bundle/macos"
+          COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$BUNDLE_DIR/Speech-Studio.app.tar.gz" -C "$BUNDLE_DIR" "Speech Studio.app"
+
+      - name: Upload .app (zipped)
+        uses: actions/upload-artifact@v4
+        with:
+          name: speech-studio-macos-arm64-app
+          path: speech-studio/src-tauri/target/release/bundle/macos/Speech-Studio.app.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+  release-windows:
+    name: Windows (x86_64)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out speech-studio
+        uses: actions/checkout@v4
+        with:
+          path: speech-studio
+
+      - name: Check out speech-core (sibling repo)
+        uses: actions/checkout@v4
+        with:
+          repository: soniqo/speech-core
+          path: speech-core
+          ref: main
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Node + pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: speech-studio/pnpm-lock.yaml
+
+      - name: Set up Python (for fetch_litert)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install JS deps
+        working-directory: speech-studio
+        run: pnpm install --frozen-lockfile
+
+      - name: Set up MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Fetch libLiteRt (ai-edge-litert wheel)
+        working-directory: speech-core
+        shell: bash
+        run: ./scripts/fetch_litert.sh litert
+
+      - name: Install libcurl (vcpkg, static-MD / Schannel)
+        shell: pwsh
+        run: '& "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install curl:x64-windows-static-md'
+
+      - name: Build speech-core (LiteRT + HF download)
+        working-directory: speech-core
+        shell: pwsh
+        run: |
+          cmake -B build -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DSPEECH_CORE_WITH_LITERT=ON `
+            -DLITERT_DIR="$PWD/litert" `
+            -DSPEECH_CORE_WITH_HF_DOWNLOAD=ON `
+            -DSPEECH_CORE_BUILD_TESTS=OFF `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md
+          cmake --build build --config Release --target speech_core_models_litert
+
+      - name: Build core-sidecar
+        working-directory: speech-studio
+        shell: pwsh
+        run: |
+          cmake -B core-sidecar/build -A x64 core-sidecar `
+            -DSPEECH_CORE_DIR="$env:GITHUB_WORKSPACE/speech-core" `
+            -DSPEECH_CORE_BUILD_DIR="$env:GITHUB_WORKSPACE/speech-core/build" `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md
+          cmake --build core-sidecar/build --config Release
+
+      - name: Run sidecar unit tests
+        working-directory: speech-studio
+        run: ctest --test-dir core-sidecar/build -C Release --output-on-failure
+
+      - name: Stage sidecar for Tauri bundler
+        working-directory: speech-studio
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force src-tauri/binaries | Out-Null
+          Copy-Item core-sidecar/build/Release/speech-core-tts-sidecar.exe `
+            src-tauri/binaries/speech-core-tts-sidecar-x86_64-pc-windows-msvc.exe
+          Copy-Item core-sidecar/build/Release/libLiteRt.dll src-tauri/binaries/libLiteRt.dll
+
+      - name: Build Tauri bundle (.msi + NSIS .exe)
+        working-directory: speech-studio
+        run: pnpm tauri build
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: speech-studio-windows-x86_64
+          path: |
+            speech-studio/src-tauri/target/release/bundle/msi/*.msi
+            speech-studio/src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  release-linux:
+    name: Linux (x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out speech-studio
+        uses: actions/checkout@v4
+        with:
+          path: speech-studio
+
+      - name: Check out speech-core (sibling repo)
+        uses: actions/checkout@v4
+        with:
+          repository: soniqo/speech-core
+          path: speech-core
+          ref: main
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Node + pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: speech-studio/pnpm-lock.yaml
+
+      - name: Set up Python (for fetch_litert)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system deps (Tauri + libcurl + cmake)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf libssl-dev libcurl4-openssl-dev \
+            build-essential cmake curl wget file
+
+      - name: Install JS deps
+        working-directory: speech-studio
+        run: pnpm install --frozen-lockfile
+
+      - name: Fetch libLiteRt (ai-edge-litert wheel)
+        working-directory: speech-core
+        run: ./scripts/fetch_litert.sh litert
+
+      - name: Build speech-core (LiteRT + HF download)
+        working-directory: speech-core
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSPEECH_CORE_WITH_LITERT=ON \
+            -DLITERT_DIR="$PWD/litert" \
+            -DSPEECH_CORE_WITH_HF_DOWNLOAD=ON \
+            -DSPEECH_CORE_BUILD_TESTS=OFF
+          cmake --build build --parallel --target speech_core_models_litert
+
+      - name: Build core-sidecar
+        working-directory: speech-studio
+        run: |
+          cmake -B core-sidecar/build core-sidecar \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSPEECH_CORE_DIR="$GITHUB_WORKSPACE/speech-core" \
+            -DSPEECH_CORE_BUILD_DIR="$GITHUB_WORKSPACE/speech-core/build"
+          cmake --build core-sidecar/build --parallel
+
+      - name: Run sidecar unit tests
+        working-directory: speech-studio
+        run: ctest --test-dir core-sidecar/build --output-on-failure
+
+      - name: Stage sidecar for Tauri bundler
+        working-directory: speech-studio
+        run: |
+          mkdir -p src-tauri/binaries
+          cp core-sidecar/build/speech-core-tts-sidecar \
+             src-tauri/binaries/speech-core-tts-sidecar-x86_64-unknown-linux-gnu
+          cp core-sidecar/build/libLiteRt.so src-tauri/binaries/libLiteRt.so
+
+      - name: Build Tauri bundle (.deb + .AppImage)
+        working-directory: speech-studio
+        run: pnpm tauri build
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: speech-studio-linux-x86_64
+          path: |
+            speech-studio/src-tauri/target/release/bundle/deb/*.deb
+            speech-studio/src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish GitHub Release
+    needs: [release-macos, release-windows, release-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: speech-studio-macos-arm64-dmg
+          path: artifacts/macos
+
+      - name: Download macOS .app artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: speech-studio-macos-arm64-app
+          path: artifacts/macos-app
+
+      - name: Download Windows installers
+        uses: actions/download-artifact@v4
+        with:
+          name: speech-studio-windows-x86_64
+          path: artifacts/windows
+
+      - name: Download Linux installers
+        uses: actions/download-artifact@v4
+        with:
+          name: speech-studio-linux-x86_64
+          path: artifacts/linux
+
+      - name: Attach installers to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.0.14
+          name: Speech Studio v0.0.14
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+          files: |
+            artifacts/macos/*.dmg
+            artifacts/macos-app/Speech-Studio.app.tar.gz
+            artifacts/windows/**/*.msi
+            artifacts/windows/**/*-setup.exe
+            artifacts/linux/**/*.deb
+            artifacts/linux/**/*.AppImage
+          fail_on_unmatched_files: true
