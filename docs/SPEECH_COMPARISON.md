@@ -27,6 +27,12 @@ comparison; everything below replaces or extends that skeleton.
   second copy.
 - **Standalone mode** (default): everything runs in-process through the bundled
   Swift/MLX sidecar, with no runtime installed.
+- **Status that reflects reality on first paint.** The daemon keys its catalog by
+  `model` while the page looks engines up by `id`; the IPC layer now normalises
+  the row (`normalizeRuntimeTtsCatalog`), so the shared-runtime status and peak
+  memory appear. Artifact state is probed for all engines on mount, so an
+  already-imported bundle no longer reads as "Download weights" until Check is
+  pressed.
 
 ## Engines
 
@@ -102,6 +108,13 @@ Behaviour worth knowing:
   engines) and restarts the daemon through `launchctl kickstart -k
   gui/<uid>/com.speechruntime.agent`. The block points `binary` at the exact
   sidecar Studio itself runs.
+- This workspace's installed daemon was rebuilt from this fork's sources and
+  installed over `~/Applications/Speech Runtime.app/Contents/MacOS/speech-runtime`
+  (previous binary kept as `speech-runtime.bak-20261111`), with the sidecar and
+  `mlx.metallib` staged in
+  `~/Library/Application Support/SpeechRuntime/TTS/` and the `tts` block added to
+  the installed `app-config.json` (backup alongside it). The daemon build without
+  those routes answers `/v1/tts/models` with 404, which is what the page reports.
 - Reference audio is normalised to 16 kHz mono PCM WAV with `/usr/bin/afconvert`
   before transcription or synthesis; only loopback traffic is used.
 
@@ -117,7 +130,7 @@ the 48 GB checks are **not** run.
 | `speech-swift` F5-TTS tests (`swift test --filter F5TTSTests`) | 22 passed |
 | `Speech-Runtime` daemon (`swift test`) | 65 passed (11 new TTS tests, fake-sidecar driven) |
 | `speech-studio` Rust (`cargo test --lib`) | 48 passed |
-| `speech-studio` frontend (`tsc --noEmit`, `vitest run`) | `tsc` clean; 92 tests in 15 files pass, including 6 for the Compare page |
+| `speech-studio` frontend (`tsc --noEmit`, `vitest run`) | `tsc` clean; 107 tests in 19 files pass, including the Compare page and runtime-catalog mapping tests |
 | Swift sidecar (`swift build`) | debug build from this tree; the staged `src-tauri/binaries/` binary is the one the checks below ran against |
 
 ### Three-engine A/B (real synthesis, one reference sample)
@@ -168,9 +181,19 @@ Interpretation:
 | Studio's Rust client (`speech_runtime_tts_synthesize`) | reference path normalised by `afconvert`, 3.58 s WAV written to the Studio clip cache |
 | Idle unload (`--idle-unload 30`) | resident ESpeech model unloaded on the next monitor tick, `loaded: false` |
 | Studio's exact sidecar payloads (`init_model` + synth, rebuilt sidecar) | espeech 4.54 s WAV, qwen3 2.56 s WAV, voxcpm2 2.58 s WAV, all `ok: true` |
+| Installed daemon rebuilt from this fork (`swift test --filter TtsHostTests`) | 11 passed; `GET /v1/tts/models` on the installed instance lists all three engines |
+| Installed daemon, `POST /v1/tts/models/load {"model":"voxcpm2"}` then catalog | `loaded: true`, `loadedModel: aufklarer/VoxCPM2-MLX-bf16` |
+| Installed daemon, `POST /v1/tts/synthesize` (3 chars, reference path) | 1.07 s WAV @ 48 kHz, peak 21323, `wallMs` 8984 |
+| Same synth, 65 chars (599 KB response) on a foreground daemon | `200`, full body; the launchd instance exited during two identical calls with a 10.8 GB sidecar footprint — cause not proven, memory pressure suspected |
 
 ## Limitations (verified vs. unverified)
 
+- **Model cache was cleared after the checks.** The ESpeech bundle
+  (`~/Library/Caches/qwen3-speech/models/local/ESpeech-TTS-1-RL-V2-MLX-fp16`) and
+  the Qwen3 weights were removed from this machine's cache, so a fresh run
+  reports `exists: false` for both until they are rebuilt/downloaded — the
+  catalog reports that correctly rather than claiming a missing model is ready.
+  The ESpeech measurements below were taken while the bundle was present.
 - **Unverified:** the 48 GB / M5 Pro scenario, and any Windows/Linux path (the
   fork's Compare page and ESpeech are macOS-only; the LiteRT engines are
   unchanged).
@@ -201,6 +224,13 @@ Interpretation:
   not waited out.
 - **Memory figures** are the sidecar's own MLX/phys-footprint snapshots; they
   exclude the Rust shell and the WebView.
+
+## Release
+
+`pnpm tauri build` produces `src-tauri/target/release/bundle/dmg/Speech Studio_0.0.13_aarch64.dmg`
+with the sidecar and `mlx.metallib` inside the app bundle. `main`, `v0.0.12`
+and `v0.0.13` are pushed to the `fork` remote (`1tuz/speech-studio`); upstream
+(`soniqo/speech-studio`) is read-only for this account.
 
 ## Rebuilding the ESpeech bundle
 
