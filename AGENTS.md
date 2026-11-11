@@ -168,6 +168,15 @@ the `release` environment gate when the macOS job pauses.
     └── src/main.cpp                       NDJSON loop over voxcpm2_c.h / indic_mio_c.h
 ```
 
+## CLI and MCP
+
+`soniqo-tools/` (pnpm workspace package `@soniqo/tools`) ships a CLI (`soniqo`) and a stdio MCP server (`soniqo-mcp`) over the same sidecar NDJSON protocol as the app. Build: `pnpm --filter @soniqo/tools build` (outputs `dist/cli.js` / `dist/mcp.js`).
+
+- **CLI** (`node soniqo-tools/dist/cli.js <cmd>`): `engines`, `ping`, `info --engine <e>`, `synthesize --engine <e> --text <t> [--voice <wav>] [--voice-text <s>] [--language <l>] [--seed <n>] [--out <path>]`, `transcribe <audioPath>`. `--json` on each; data on stdout, logs on stderr.
+- **MCP tools**: `soniqo_list_engines`, `soniqo_model_info`, `soniqo_ping`, `soniqo_transcribe`, `soniqo_synthesize`. Each call spawns a fresh sidecar; TTS models download on first use.
+- **Env**: `SONIQO_SIDECAR_PATH` (binary override), `SONIQO_MODEL_REGISTRY` (registry override), `SONIQO_SIDECAR_TIMEOUT_MS` (per-request timeout).
+- Sidecar binary resolution: `SONIQO_SIDECAR_PATH` → `swift-sidecar/.build/debug/soniqo-tts-sidecar` → `src-tauri/binaries/soniqo-tts-sidecar-<triple>`. Registry: `model-registry.json` at the repo root.
+
 ## Commits and pull requests
 
 - Do **not** mention Claude, Codex, Cursor, Anthropic, OpenAI, or any AI assistant in commit messages, PR titles, PR descriptions, or code comments.

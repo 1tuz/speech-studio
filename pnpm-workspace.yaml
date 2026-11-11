@@ -1,2 +1,4 @@
+packages:
+  - soniqo-tools
 allowBuilds:
   esbuild: true
