@@ -404,12 +404,15 @@ export function setRuntimeMode(settings: RuntimeModeSettings): Promise<RuntimeMo
 }
 
 export interface RuntimeTtsModel {
+  /** Catalog name (`espeech`, `qwen3`, `voxcpm2`), used as the engine id. */
   id: string;
   displayName: string;
+  engine?: string;
   modelId: string;
-  languages: string[];
+  languages?: string[];
   variants?: Array<{ id: string; modelId: string; precision?: string; label?: string }>;
   loaded: boolean;
+  loadedVariant?: string | null;
   loadedModelId?: string | null;
 }
 
@@ -426,8 +429,39 @@ export interface RuntimeTtsCatalog {
   models: RuntimeTtsModel[];
 }
 
-export function speechRuntimeTtsModels(): Promise<RuntimeTtsCatalog> {
-  return invoke<RuntimeTtsCatalog>("speech_runtime_tts_models");
+/**
+ * The daemon's catalog rows are keyed by `model` (the catalog name), while the
+ * studio addresses engines by `id`. Normalise here so callers can look a row up
+ * with `models.find((m) => m.id === engine)` — without this every lookup missed
+ * and the compare page could never show whether the runtime has a model loaded.
+ */
+export function normalizeRuntimeTtsCatalog(raw: unknown): RuntimeTtsCatalog {
+  const rows = (raw as { models?: unknown } | null)?.models;
+  if (!Array.isArray(rows)) return { models: [] };
+  return {
+    models: rows
+      .filter((row): row is Record<string, unknown> => typeof row === "object" && row !== null)
+      .map((row) => {
+        const id = String(row.id ?? row.model ?? row.engine ?? "");
+        return {
+          ...(row as unknown as RuntimeTtsModel),
+          id,
+          engine: typeof row.engine === "string" ? row.engine : id,
+          displayName:
+            typeof row.displayName === "string" && row.displayName
+              ? row.displayName
+              : id,
+          loaded: row.loaded === true,
+        };
+      })
+      .filter((row) => row.id !== ""),
+  };
+}
+
+export async function speechRuntimeTtsModels(): Promise<RuntimeTtsCatalog> {
+  return normalizeRuntimeTtsCatalog(
+    await invoke<unknown>("speech_runtime_tts_models"),
+  );
 }
 
 export function speechRuntimeTtsLoad(model: string, variant?: string): Promise<unknown> {

@@ -216,6 +216,24 @@ export function VoiceCompare() {
     };
   }, []);
 
+  // Show the real download state on first paint. Without this every card
+  // claimed "Download weights" until the user pressed Check, so an already
+  // imported ESpeech bundle still looked like a missing model.
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.all(COMPARE_ENGINES.map((engine) => refreshArtifact(engine))).then(
+      (infos) => {
+        if (cancelled) return;
+        setArtifacts(
+          Object.fromEntries(COMPARE_ENGINES.map((engine, index) => [engine, infos[index]])),
+        );
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   useEffect(() => {
     // Default each engine to its registry variant, without overwriting a user pick.
     setChoices((current) => {
