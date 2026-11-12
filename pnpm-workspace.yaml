@@ -2,3 +2,5 @@ packages:
   - soniqo-tools
 allowBuilds:
   esbuild: true
+
+minimumReleaseAge: 0
